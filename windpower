@@ -1,0 +1,398 @@
+ REPORT zinput_report.
+
+TABLES: knvv, knvp, t001l, kna1, mseg, mkpf, adrc, zsdwind_alloc.
+
+" Define selection screen parameters
+TYPES: BEGIN OF ty_table_entry,
+         plant                 TYPE werks,
+         monthh                TYPE MONUM,
+         yearr                 TYPE MJAHR,
+         sold_to               TYPE kunnr,
+         bill_to               TYPE kunn2,
+         ship_to               TYPE kunnr,
+         phase_sloc            TYPE lgort_d,
+         phase_name            TYPE lgort_d,
+         generated_qty         TYPE p DECIMALS 2,
+         allocated_qty         TYPE p DECIMALS 2,
+         consumption_qty       TYPE p DECIMALS 2,
+         surplus_sales         TYPE p DECIMALS 2,
+         room_no               TYPE ad_addrnum,
+         konzs                 TYPE konzs,
+         allocation_pct        TYPE zdecm,
+         wheeling_charges_pct  TYPE zwcharge,
+         active                TYPE flag,
+         scol                  TYPE lvc_t_scol,
+       END OF ty_table_entry.
+
+DATA: lt_internal_table TYPE TABLE OF ty_table_entry,
+      wa_internal_table TYPE ty_table_entry,
+      gr_alv            TYPE REF TO cl_salv_table,
+      lt_color          TYPE lvc_t_scol,
+      ls_color          TYPE lvc_s_scol.
+
+SELECTION-SCREEN BEGIN OF BLOCK block1 WITH FRAME TITLE text-001.
+SELECT-OPTIONS: s_plant FOR zsdwind_alloc-plant NO-EXTENSION,
+                s_soldto FOR knvp-kunnr NO-EXTENSION,
+                s_billto FOR knvp-kunn2 NO-EXTENSION.
+PARAMETERS:s_month TYPE monum OBLIGATORY,
+            s_year  TYPE mjahr OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK block1.
+
+
+" Set default value for s_plant and disable input
+INITIALIZATION.
+  s_plant-low = '20V1'.
+  s_plant-sign = 'I'.
+  s_plant-option = 'EQ'.
+  APPEND s_plant.
+
+AT SELECTION-SCREEN OUTPUT.
+  LOOP AT SCREEN.
+    " Hide HIGH fields for SELECT-OPTIONS
+    IF screen-name = 'S_PLANT-HIGH' OR
+       screen-name = 'S_MONTH-HIGH' OR
+       screen-name = 'S_YEAR-HIGH' OR
+       screen-name = 'S_SOLDTO-HIGH' OR
+       screen-name = 'S_BILLTO-HIGH'.
+      screen-active = 0.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+
+
+START-OF-SELECTION.
+  " Initialize work area with selection screen inputs
+  wa_internal_table-plant = s_plant-low.
+  wa_internal_table-monthh = s_month.          "-low+4(2). " Extract month part rom date
+  wa_internal_table-yearr = s_year.              "-low+0(4). " Extract year part from date
+  wa_internal_table-bill_to = s_billto.           "-low.
+
+  " Fetch room number from ADRC table
+  DATA: lt_adrc TYPE TABLE OF adrc,
+        wa_adrc TYPE adrc. " Internal table for bill_to
+  SELECT *
+    FROM adrc
+    INTO TABLE lt_adrc
+    WHERE roomnumber IN s_billto.
+
+  IF sy-subrc = 0.
+    LOOP AT lt_adrc INTO wa_adrc.
+      " Fetch ship-to party from KNA1 table
+      DATA: lv_addrnumber TYPE string,
+            lv_zeros TYPE string,
+            lv_adrnr_length TYPE i,
+            lv_needed_length TYPE i.
+
+      wa_adrc-addrnumber = wa_adrc-roomnumber.
+
+      " Check if addrnumber is not initial and of the desired length
+      IF wa_adrc-addrnumber IS NOT INITIAL AND STRLEN( wa_adrc-addrnumber ) = 10.
+        lv_addrnumber = wa_adrc-addrnumber.
+      ELSEIF wa_adrc-addrnumber IS NOT INITIAL AND STRLEN( wa_adrc-addrnumber ) > 10.
+        MESSAGE e999(zmsg_class) WITH 'Address number exceeds maximum length of 10 characters'.
+      ELSE.
+        MESSAGE e998(zmsg_class) WITH 'Address number is initial or empty'.
+      ENDIF.
+
+      " Ensure lv_addrnumber is exactly 6 characters long
+*      IF STRLEN( lv_addrnumber ) = 10.
+*        lv_addrnumber = lv_addrnumber+4(6). " Take the last 6 characters
+*      ENDIF.
+
+      IF lv_addrnumber IS NOT INITIAL.
+        " Use the transformed address number in the SELECT statement
+        SELECT single kunnr
+          FROM kna1
+          INTO wa_internal_table-ship_to
+          WHERE adrnr = lv_addrnumber
+            AND ktokd = '0170'.
+
+      write: /'address number:',kna1-kunnr.
+        IF sy-subrc = 0 AND wa_internal_table-ship_to IS NOT INITIAL.
+          " Continue with your processing for ship_to found
+          EXIT. " Exit loop once ship_to is found
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+    IF sy-subrc <> 0 OR wa_internal_table-ship_to IS INITIAL.
+      MESSAGE e002(zmsg_class). " No ship_to found for the given bill_to value
+    ENDIF.
+  ELSE.
+    MESSAGE e001(zmsg_class). " No addrnumber found for the given bill_to value
+  ENDIF.
+
+
+  IF wa_internal_table-ship_to IS NOT INITIAL.
+  DATA: lv_phase TYPE zsdwind_alloc-phase.
+
+  " Debugging: Print the value of wa_internal_table-ship_to
+  WRITE: / 'Ship to party:', wa_internal_table-ship_to.
+
+  " Ensure the value matches the expected format
+  IF NOT wa_internal_table-ship_to IS INITIAL.
+    " Fetch phase from ZSDWIND_ALLOC table
+    SELECT SINGLE phase
+      INTO lv_phase
+      FROM zsdwind_alloc
+      WHERE ship_to_party = wa_internal_table-ship_to
+        AND active = 'X'.
+
+    IF sy-subrc = 0.
+      wa_internal_table-phase_name = lv_phase.
+    ELSE.
+      " Debugging: Print an error message if the phase is not found
+      WRITE: / 'Phase not found for ship to party:', wa_internal_table-ship_to.
+    ENDIF.
+  ELSE.
+    " Debugging: Print an error message if ship_to is initial
+    WRITE: / 'Ship to party is initial:', wa_internal_table-ship_to.
+  ENDIF.
+ENDIF.
+
+
+    IF sy-subrc = 0.
+      wa_internal_table-phase_name = lv_phase.
+
+      DATA: lv_allocation TYPE ZDECM,
+            lv_wcharge TYPE ZWCHARGE.
+
+      DATA: lv_cust TYPE KUNNR, " Adjust length as needed
+            lv_cons_qty TYPE LFIMG.
+
+      DATA: lv_gen_qty TYPE LFIMG.
+
+      " Initialize input parameters for the function module
+*      lv_allocation = 000. " Replace with actual value
+*      lv_wcharge = 0000. " Replace with actual value
+
+*      lv_cust = 'some_customer_value'.
+*     lv_cons_qty = 'some_consumption_qty'.
+
+*      lv_gen_qty = 'some_generated_qty'.
+
+      " Call the function module ZSDWIND_GETALL
+      CALL FUNCTION 'ZSDWIND_GETALL'
+        EXPORTING
+          phase = wa_internal_table-phase_name
+          customer = wa_internal_table-sold_to
+        IMPORTING
+           allocation = lv_allocation
+          wcharge = lv_wcharge
+        EXCEPTIONS
+          OTHERS = 1.
+
+      IF sy-subrc = 0.
+        " Call the function module ZSDWIND_GETGEN
+        CALL FUNCTION 'ZSDWNID_GETGEN'
+          EXPORTING
+            type_gen = wa_internal_table-active
+            phase = wa_internal_table-phase_name
+            year = wa_internal_table-yearr
+            month = wa_internal_table-monthh
+            plant = wa_internal_table-plant
+          IMPORTING
+           gen_quantity = lv_gen_qty
+          EXCEPTIONS
+            OTHERS = 1.
+
+        IF sy-subrc = 0.
+          " Call the function module ZSDWWNID_GETCONS
+          CALL FUNCTION 'ZSDWNID_GETCONS'
+            EXPORTING
+              year = wa_internal_table-yearr
+              customer = wa_internal_table-sold_to
+              month = wa_internal_table-monthh
+              sloc = wa_internal_table-phase_sloc
+              plant = wa_internal_table-plant
+            IMPORTING
+              cust_cc = lv_cust
+              cons_quantity = lv_cons_qty
+            EXCEPTIONS
+              OTHERS = 1.
+
+          IF sy-subrc = 0.
+            " Perform calculations
+            wa_internal_table-allocated_qty = wa_internal_table-generated_qty * ( 100 - wa_internal_table-wheeling_charges_pct ) / 100.
+            wa_internal_table-surplus_sales = wa_internal_table-allocated_qty - wa_internal_table-consumption_qty.
+
+            " Append to internal table
+            APPEND wa_internal_table TO lt_internal_table.
+          ELSE.
+            MESSAGE e006(zmsg_class).
+          ENDIF.
+        ELSE.
+          MESSAGE e005(zmsg_class). " Function module ZSDWWIND_GETGEN call failed
+        ENDIF.
+      ELSE.
+        MESSAGE e004(zmsg_class). " Function module ZSDWWIND_GETALL call failed
+      ENDIF.
+    ELSE.
+      MESSAGE e003(zmsg_class). " No phase found for the given ship_to value.
+    ENDIF.
+*    MESSAGE e002(zmsg_class). " No ship_to found for the given bill_to value.
+
+  " Set colors for specific columns
+  CLEAR: lt_color, ls_color.
+
+  ls_color-color-col = '7'.  " Yellow
+  ls_color-fname = 'GENERATED_QTY'.
+  APPEND ls_color TO lt_color.
+
+  ls_color-color-col = '5'.  " Light Red
+  ls_color-fname = 'ALLOCATED_QTY'.
+  APPEND ls_color TO lt_color.
+
+  ls_color-color-col = '5'.  " Light Red
+  ls_color-fname = 'CONSUMPTION_QTY'.
+  APPEND ls_color TO lt_color.
+
+  LOOP AT lt_internal_table INTO wa_internal_table.
+    wa_internal_table-scol = lt_color.
+    MODIFY lt_internal_table FROM wa_internal_table.
+  ENDLOOP.
+
+  TRY.
+    CALL METHOD cl_salv_table=>factory
+      IMPORTING
+        r_salv_table = gr_alv
+      CHANGING
+        t_table      = lt_internal_table.
+
+    DATA(lo_columns) = gr_alv->get_columns( ).
+
+    " Set column headers
+*    DATA(lo_column) = lo_columns->get_column( 'PLANT' ).
+*    lo_column->set_short_text( 'Plant').
+*   lo_column->set_medium_text( 'PLANT' ).
+*    lo_column->set_long_text( 'PLANT' ).
+*    lo_column->set_output_length('5').
+    DATA(lo_column) = lo_columns->get_column( 'MONTHH' ).
+    lo_column = lo_columns->get_column( 'MONTHH' ).
+    lo_column->set_short_text( 'Month').
+
+    lo_column = lo_columns->get_column( 'YEARR' ).
+    lo_column->set_short_text( 'Year').
+
+    lo_column = lo_columns->get_column( 'SOLD_TO' ).
+    lo_column->set_short_text( 'CUSTOMER' ).
+    lo_column->set_medium_text( 'CUSTOMER (SOLD TO)' ).
+    lo_column->set_long_text( 'CUSTOMER (SOLD TO)' ).
+    lo_column->set_output_length('17').
+
+    lo_column = lo_columns->get_column( 'BILL_TO' ).
+    lo_column->set_short_text( 'Bill_To').
+    lo_column->set_medium_text( 'DIVISION (BILL TO)' ).
+    lo_column->set_long_text( 'DIVISION (BILL TO)' ).
+    lo_column->set_output_length('20').
+
+    lo_column = lo_columns->get_column( 'GENERATED_QTY' ).
+    lo_column->set_short_text( 'GEN' ).
+    lo_column->set_medium_text( 'GENERATED QTY' ).
+    lo_column->set_long_text( 'GENERATED QTY' ).
+    lo_column->set_output_length('20').
+
+    lo_column = lo_columns->get_column( 'ALLOCATED_QTY' ).
+    lo_column->set_short_text( 'ALLOC' ).
+    lo_column->set_medium_text( 'ALLOCATION QTY' ).
+    lo_column->set_long_text( 'ALLOCATION QTY' ).
+    lo_column->set_output_length('20').
+
+    lo_column = lo_columns->get_column( 'CONSUMPTION_QTY' ).
+    lo_column->set_short_text( 'CONS' ).
+    lo_column->set_medium_text( 'CONSUMPTION QTY' ).
+    lo_column->set_long_text( 'CONSUMPTION QTY' ).
+    lo_column->set_output_length('20').
+
+    lo_column = lo_columns->get_column( 'SURPLUS_SALES' ).
+    lo_column->set_short_text( 'SURPLUS' ).
+    lo_column->set_medium_text( 'SURPLUS SALES' ).
+    lo_column->set_long_text( 'SURPLUS SALES' ).
+    lo_column->set_output_length('20').
+
+    lo_column = lo_columns->get_column( 'WHEELING_CHARGES_PCT' ).
+    lo_column->set_short_text( 'wheeling' ).
+    lo_column->set_medium_text( 'WHEEL CHRG' ).
+    lo_column->set_long_text( 'wheeling_charges_pct' ).
+    lo_column->set_output_length('20').
+
+    lo_column = lo_columns->get_column( 'SHIP_TO' ).
+    lo_column->set_short_text( 'ONGC INST' ).
+    lo_column->set_medium_text( 'ONGC INSTALL' ).
+    lo_column->set_long_text( 'ONGC INSTALLATION (SHIP TO)' ).
+    lo_column->set_output_length('23').
+
+    lo_column = lo_columns->get_column( 'PHASE_SLOC' ).
+    lo_column->set_short_text( 'Phase' ).
+    lo_column->set_medium_text( 'Phase SLOC' ).
+    lo_column->set_long_text( 'Phase SLOC' ).
+    lo_column->set_output_length('15').
+
+    lo_column = lo_columns->get_column( 'PHASE_NAME' ).
+    lo_column->set_short_text( 'PHASE' ).
+    lo_column->set_medium_text( 'PHASE NAME' ).
+    lo_column->set_long_text( 'Phase NAME' ).
+    lo_column->set_output_length('15').
+
+    lo_column = lo_columns->get_column( 'ROOM_NO' ).
+    lo_column->set_short_text( 'ROOM_NO' ).
+    lo_column->set_medium_text( 'HT CONNECTION' ).
+    lo_column->set_long_text( 'HT CONNECTION NUMBER' ).
+    lo_column->set_output_length('30').
+
+    lo_column = lo_columns->get_column( 'KONZS' ).
+    lo_column->set_short_text( 'COST C' ).
+    lo_column->set_medium_text( 'COST CENTRE' ).
+    lo_column->set_long_text( 'COST CENTRE FOR CONSUMPTION (KONZS)' ).
+    lo_column->set_output_length('35').
+
+    lo_column = lo_columns->get_column( 'ALLOCATION_PCT' ).
+    lo_column->set_short_text( 'ALLOC %' ).
+    lo_column->set_medium_text( 'ALLOCATION %' ).
+    lo_column->set_long_text( 'ALLOCATION %' ).
+    lo_column->set_output_length('12').
+
+    lo_column = lo_columns->get_column( 'ACTIVE' ).
+    lo_column->set_short_text( 'ACTIVE' ).
+    lo_column->set_medium_text( 'ACTIVE (YESNO)' ).
+    lo_column->set_long_text( 'ACTIVE (YESNO)' ).
+    lo_column->set_output_length('10').
+
+    PERFORM generic_functions.
+    PERFORM layout_settings.
+
+    gr_alv->display( ).
+  CATCH cx_salv_msg INTO DATA(lx_msg).
+    MESSAGE lx_msg TYPE 'E'.
+ENDTRY.
+
+FORM generic_functions .
+  DATA: lo_functions TYPE REF TO cl_salv_functions_list.
+
+  TRY.
+      lo_functions = gr_alv->get_functions( ).
+      lo_functions->set_all( abap_true ).
+
+    CATCH cx_salv_data_error.
+
+    CLEANUP.
+
+  ENDTRY.
+
+ENDFORM.
+
+FORM layout_settings .
+
+  DATA lref_layout_settings TYPE REF TO cl_salv_layout.
+  DATA ls_layout_key      TYPE salv_s_layout_key.
+
+  lref_layout_settings = gr_alv->get_layout( ).
+
+  ls_layout_key-report = sy-repid.
+  lref_layout_settings->set_key( ls_layout_key ).
+  lref_layout_settings->set_default( abap_true ).
+  lref_layout_settings->set_save_restriction( if_salv_c_layout=>restrict_none ).
+
+ENDFORM.
+
+INCLUDE ZINPUT2_FNC.

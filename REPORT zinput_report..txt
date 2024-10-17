@@ -1,0 +1,176 @@
+REPORT zinput_report.
+
+TABLES: zpower_gen, knvv, knvp, t001l, kna1, mseg, mkpf, adrc.
+" Define selection screen parameters
+SELECTION-SCREEN BEGIN OF BLOCK block1 WITH FRAME TITLE text-001.
+PARAMETERS: plant TYPE zpower_gen-plant_code,
+            month TYPE zpower_gen-monthh,
+            year TYPE zpower_gen-yearr,
+            sold_to TYPE zpower_gen-customerdiscount,
+            bill_to TYPE zpower_gen-divison.
+SELECTION-SCREEN END OF BLOCK block1.
+
+" Add submit button
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN: PUSHBUTTON (10) text-002 USER-COMMAND submit_btn.
+SELECTION-SCREEN: PUSHBUTTON (10) text-003 USER-COMMAND view.
+SELECTION-SCREEN END OF LINE.
+
+" Define structure for output table
+TYPES: BEGIN OF zoutput_structure,
+         ship_to      TYPE kna1-kunnr,
+         phase        TYPE zsdwind_alloc-phase,
+         generated    TYPE p DECIMALS 2,
+         consumption  TYPE p DECIMALS 2,
+         allocated    TYPE p DECIMALS 2,
+         surplus      TYPE p DECIMALS 2,
+       END OF zoutput_structure.
+TYPES: BEGIN OF zout_structure,
+         ship_to      TYPE kna1-kunnr,
+         phase        TYPE zsdwind_alloc-phase,
+         generated    TYPE p DECIMALS 2,
+         consumption  TYPE p DECIMALS 2,
+         allocated    TYPE p DECIMALS 2,
+         surplus      TYPE p DECIMALS 2,
+       END OF zout_structure.
+
+" Internal table and work areas
+DATA: it_ship_to TYPE TABLE OF kna1-kunnr,
+      wa_ship_to TYPE kna1-kunnr,
+      addrnumber TYPE adrc-addrnumber,
+      wa_phase TYPE zsdwind_alloc-phase,
+      generated_qty TYPE p DECIMALS 2,
+      consumption_qty TYPE p DECIMALS 2,
+      allocated_qty TYPE p DECIMALS 2,
+      surplus_qty TYPE p DECIMALS 2,
+      wheeling TYPE p DECIMALS 2,
+      it_output TYPE TABLE OF zout_structure,
+      wa_output TYPE zout_structure.
+
+" Handle selection screen events
+AT SELECTION-SCREEN.
+  CASE sy-ucomm.
+    WHEN 'SUBMIT_BTN'.
+      PERFORM handle_submit.
+    WHEN 'VIEW'.
+      PERFORM display_alv.
+  ENDCASE.
+
+" Start of selection event
+START-OF-SELECTION.
+  " Placeholder if any initial processing is needed
+  PERFORM fetch_data.
+
+" Perform fetch data
+FORM fetch_data.
+  " Step 1: Retrieve ADDRNUMBER from ADRC table
+  SELECT SINGLE addrnumber
+    INTO addrnumber
+    FROM adrc
+    WHERE roomnumber = bill_to.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Bill-to address not found' TYPE 'E'.
+    RETURN.
+  ENDIF.
+
+  " Step 2: Retrieve KUNNR (ship-to) from KNA1 table
+  SELECT kunnr
+    INTO TABLE it_ship_to
+    FROM kna1
+    WHERE adrnr = addrnumber
+      AND ktokd = '0002'.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'No ship-to customers found' TYPE 'E'.
+    RETURN.
+  ENDIF.
+
+  " Step 3: Loop through ship-to values
+  LOOP AT it_ship_to INTO wa_ship_to.
+    " Step 4: Retrieve PHASE from ZSDWIND_ALLOC
+    SELECT SINGLE phase
+      INTO wa_phase
+      FROM zsdwind_alloc
+      WHERE ship_to_party = wa_ship_to
+        AND active = 'X'.
+
+    IF sy-subrc <> 0.
+      CONTINUE. " Skip if no active phase found
+    ENDIF.
+
+    " Step 5: Call Function Modules
+    CALL FUNCTION 'ZSDWIND_GETALL'
+      EXPORTING
+        ship_to = wa_ship_to
+      IMPORTING
+        wheeling = wheeling
+      EXCEPTIONS
+        OTHERS = 1.
+    IF sy-subrc <> 0.
+      MESSAGE 'Error calling ZSDWIND_GETALL' TYPE 'E'.
+      CONTINUE.
+    ENDIF.
+
+    CALL FUNCTION 'ZSDWNID_GETGEN'
+      EXPORTING
+        ship_to = wa_ship_to
+      IMPORTING
+        gen_qty = generated_qty
+      EXCEPTIONS
+        OTHERS = 1.
+    IF sy-subrc <> 0.
+      MESSAGE 'Error calling ZSDWNID_GETGEN' TYPE 'E'.
+      CONTINUE.
+    ENDIF.
+
+    CALL FUNCTION 'ZSDWNID_GETCONS'
+      EXPORTING
+        ship_to = wa_ship_to
+      IMPORTING
+        cons_qty = consumption_qty
+      EXCEPTIONS
+        OTHERS = 1.
+    IF sy-subrc <> 0.
+      MESSAGE 'Error calling ZSDWNID_GETCONS' TYPE 'E'.
+      CONTINUE.
+    ENDIF.
+
+    " Step 6: Perform Calculations
+    allocated_qty = generated_qty * ( 100 - wheeling ) / 100.
+    surplus_qty = allocated_qty - consumption_qty.
+
+    " Step 7: Populate output internal table
+    wa_output-ship_to = wa_ship_to.
+    wa_output-phase = wa_phase.
+    wa_output-generated = generated_qty.
+    wa_output-consumption = consumption_qty.
+    wa_output-allocated = allocated_qty.
+    wa_output-surplus = surplus_qty.
+    APPEND wa_output TO it_output.
+  ENDLOOP.
+ENDFORM.
+
+" Handle submit button
+FORM handle_submit.
+  PERFORM fetch_data.
+  PERFORM display_alv.
+ENDFORM.
+
+" Display ALV grid
+FORM display_alv.
+  DATA: lo_alv TYPE REF TO cl_salv_table.
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = lo_alv
+        CHANGING
+          t_table      = it_output ).
+
+      lo_alv->display( ).
+
+    CATCH cx_salv_msg INTO DATA(lx_msg).
+      MESSAGE lx_msg TYPE 'E'.
+  ENDTRY.
+ENDFORM.
